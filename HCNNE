@@ -1,0 +1,1078 @@
+from __future__ import print_function, division
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim import lr_scheduler
+import numpy as np
+import torchvision
+from torchvision import datasets, models, transforms
+from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
+import time
+import os
+import copy
+import random
+from os.path import normpath, basename
+from skimage import io
+from PIL import Image
+from sklearn.metrics import confusion_matrix
+from matplotlib import cm
+from sklearn import svm
+from sklearn.neighbors.nearest_centroid import NearestCentroid
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.decomposition import PCA
+import itertools
+from sklearn.metrics import precision_recall_curve
+from sklearn.metrics import average_precision_score
+from inspect import signature
+from sklearn.metrics import roc_curve, auc
+from sklearn.preprocessing import label_binarize
+from sklearn.multiclass import OneVsRestClassifier
+from skimage import feature
+from sklearn.svm import LinearSVC
+import cv2
+
+plt.ion()
+
+# -----------------------------------------------------------------------------------------------
+# REPEATING TRAINING
+# -----------------------------------------------------------------------------------------------
+
+#seeds = [279, 565, 732, 183, 972, 311, 446, 692, 821, 798]
+seeds = [279]
+
+d = 0
+avg_epoch_loss = []
+avg_train_loss = []
+avg_best_acc = []
+avg_mat = []
+avg_clf1 = []
+avg_clf2 = []
+avg_clf3 = []
+avg_clf4 = []
+avg_lbp = []
+avg_lbpnn = []
+avg_lbpnn2 = []
+avg_ens = []
+avg_recall = []
+avg_time = []
+avg_prec_rec = []
+
+for seed1 in seeds:
+    print(seed1)
+
+    since0 = time.time()
+
+# -----------------------------------------------------------------------------------------------
+# CUSTOMIZED CLASS DATASET
+# -----------------------------------------------------------------------------------------------
+
+    class TextureDataset(Dataset):
+
+        def __init__(self, root_dir, sample, transform=None):
+
+            self.root_dir = root_dir
+            self.transform = transform
+            path = os.path.dirname(self.root_dir)
+            self.classes = os.listdir(path)
+            self.sample = sample
+                               
+        def __len__(self):
+            lista = os.listdir(self.root_dir)
+            return int(len(lista)/2)  # requires an even number of samples
+
+        def __getitem__(self, idx):
+
+            lista = os.listdir(self.root_dir)
+            root_list = [self.root_dir]*(len(lista))
+            img_name = []
+            for k in range(len(lista)):
+                if lista[k] != 'Thumbs.db':
+                    img_name.append(os.path.join(root_list[k], lista[k]))
+        
+            random.seed(seed1) # seed
+            random.shuffle(img_name) 
+            if self.sample == 'train':   
+                img_name.reverse()
+            image = io.imread(img_name[idx])
+            
+            if "uiuc" in self.root_dir or "umd" in self.root_dir:
+                image = np.repeat(image[..., np.newaxis], 3, -1)    #creating two aditional channels (adaptation for RGB)      
+            
+            img = Image.fromarray(image)
+            label = basename(normpath(self.root_dir))
+            label = self.classes.index(label)
+
+            if self.transform:
+                img = self.transform(img)
+
+            return (img, label)
+    
+        def classes(self):
+
+            return self.classes
+        
+        def paths(self, direc):
+            
+            lista = os.listdir(self.root_dir)
+            root_list = [self.root_dir]*(len(lista))
+            img_name = []
+            for k in range(len(lista)):
+                if lista[k] != 'Thumbs.db':
+                    img_name.append(os.path.join(root_list[k], lista[k]))
+        
+            random.seed(seed1) # seed
+            random.shuffle(img_name) 
+            if self.sample == 'train':   
+                img_name.reverse()
+    
+# -----------------------------------------------------------------------------------------------
+# DATA AUGMENTATION AND NORMALIZATION
+# -----------------------------------------------------------------------------------------------
+    
+    data_transforms = {
+        'train': transforms.Compose([
+            transforms.Resize(200),
+            transforms.CenterCrop(200),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ]),
+        'val': transforms.Compose([
+            transforms.Resize(200),
+            transforms.CenterCrop(200),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ]),
+    }
+    
+# -----------------------------------------------------------------------------------------------
+# SETTING DATABASE ROOTS
+# -----------------------------------------------------------------------------------------------
+  
+    root = r'D:\Datasets\Databases\Cysts4' #two classes cysts dataset (ks x r)
+    #root = r'D:\Datasets\Databases\Cysts3' #two classes cysts dataset (k x s)
+    #root = r'D:\Datasets\Databases\Cysts2' #three classes cysts dataset (k x s x r)
+    #root = r'D:\Datasets\Databases\uiuc' #texture dataset (UIUC)
+    #root = r'D:\Datasets\Databases\umd' #texture dataset (UMD)
+
+# -----------------------------------------------------------------------------------------------
+# LOADING AND ADJUSTING DATASETS
+# -----------------------------------------------------------------------------------------------
+    
+    classes = os.listdir(root)
+    data_dir = []
+    image_datasets = {'train': [] , 'val': []}
+
+    for i in range(len(classes)):
+        data_dir.append(os.path.join(root,classes[i]))
+    
+    for i in range(len(classes)):
+        image_datasets['val'].append(TextureDataset(data_dir[i], 'val', data_transforms['val']))
+        image_datasets['train'].append(TextureDataset(data_dir[i], 'train', data_transforms['train']))
+
+    image_datasets = {x: torch.utils.data.ConcatDataset(image_datasets[x]) for x in ['train', 'val']}
+    
+    dataloaders = {x: torch.utils.data.DataLoader(image_datasets[x], batch_size=4, shuffle=True, num_workers=0)
+                  for x in ['train', 'val']}
+    dataset_sizes = {x: len(image_datasets[x]) for x in ['train', 'val']}
+    class_names = classes
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+# -----------------------------------------------------------------------------------------------
+# NETWORK TRAINING FUNCTION
+# -----------------------------------------------------------------------------------------------
+
+    def train_model(model, criterion, optimizer, scheduler, num_epochs=25):
+        since = time.time()
+        epoch_loss = np.zeros(num_epochs)
+        train_loss = np.zeros(num_epochs)
+
+        best_model_wts = copy.deepcopy(model.state_dict())
+        best_acc = 0.0
+        
+        cont = 0
+        for epoch in range(num_epochs):
+            print('Epoch {}/{}'.format(epoch, num_epochs - 1))
+            print('-' * 10)
+
+            # Each epoch has a training and validation phase
+            for phase in ['train', 'val']:
+                if phase == 'train':
+                    scheduler.step()
+                    model.train()  # Set model to training mode
+                else:
+                    model.eval()   # Set model to evaluate mode
+
+                running_loss = 0.0
+                running_corrects = 0
+
+                # Iterate over data.
+                for inputs, labels in dataloaders[phase]:
+                    #print(inputs)
+                    inputs = inputs.to(device)
+                    labels = labels.to(device)
+
+                    # zero the parameter gradients
+                    optimizer.zero_grad()
+
+                    # forward
+                    # track history if only in train
+                    with torch.set_grad_enabled(phase == 'train'):
+                        outputs = model(inputs)
+                        _, preds = torch.max(outputs, 1)
+                        loss = criterion(outputs, labels)
+
+                        # backward + optimize only if in training phase
+                        if phase == 'train':
+                            loss.backward()
+                            optimizer.step()
+    
+                    # statistics
+                    running_loss += loss.item() * inputs.size(0)
+                    running_corrects += torch.sum(preds == labels.data)
+                if phase == 'train':
+                    train_loss[cont] = running_loss / dataset_sizes[phase]
+                epoch_loss[cont] = running_loss / dataset_sizes[phase]
+                epoch_acc = running_corrects.double() / dataset_sizes[phase]
+    
+                print('{} Loss: {:.4f} Acc: {:.4f}'.format(phase, epoch_loss[cont], epoch_acc))
+
+                # deep copy the model
+                if phase == 'val' and epoch_acc > best_acc:
+                    best_acc = epoch_acc
+                    best_model_wts = copy.deepcopy(model.state_dict())
+                
+                if phase == 'val': 
+                    cont = cont + 1
+                
+            print()
+        
+        avg_train_loss.append(train_loss)
+        avg_epoch_loss.append(epoch_loss)
+        avg_best_acc.append(best_acc)
+
+        time_elapsed = time.time() - since
+        print('Training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
+        print('Best val Acc: {:4f}'.format(best_acc))
+
+        # load best model weights
+        model.load_state_dict(best_model_wts)
+        return model
+          
+# -----------------------------------------------------------------------------------------------
+# FUNCTION TO DISPLAY NETWORK RESULTS
+# -----------------------------------------------------------------------------------------------
+        
+    def visualize_model(model, num_images=32):
+        was_training = model.training
+        model.eval()
+        images_so_far = 0
+    
+        with torch.no_grad():
+            for i, (inputs, labels) in enumerate(dataloaders['val']):
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+                outputs = model(inputs)
+                _, preds = torch.max(outputs, 1)
+
+                for j in range(inputs.size()[0]):
+                    images_so_far += 1
+                    ax = plt.subplot(num_images//2, 2, images_so_far)
+                    ax.axis('off')
+                    ax.set_title('predicted: {}   label: {}'.format(class_names[preds[j]],class_names[labels[j]]))
+
+                    if images_so_far == num_images:
+                        model.train(mode=was_training)
+                        return
+            model.train(mode=was_training)
+            
+# -----------------------------------------------------------------------------------------------
+# ADJUSTING FINE-TUNING PARAMETERS
+# -----------------------------------------------------------------------------------------------
+    
+    num_classes = len(class_names)
+    model_name = 'resnet'
+    #model_name = 'alexnet'
+    #model_type = 'ft'
+    model_type = 'conv'
+    num_epochs = 15
+    lr = 0.0001
+    
+    if model_type == 'ft':
+        if model_name == 'resnet':
+    
+            model_ft = models.resnet18(pretrained=True)
+            num_ftrs = model_ft.fc.in_features
+            model_ft.fc = nn.Linear(num_ftrs, num_classes)
+        
+        if model_name == 'alexnet':
+        
+            model_ft = models.alexnet(pretrained=True)
+            num_ftrs = model_ft.classifier[6].in_features
+            model_ft.classifier[6] = nn.Linear(num_ftrs,num_classes)
+
+        model_ft = model_ft.to(device)
+
+        criterion = nn.CrossEntropyLoss()
+
+        # Observe that all parameters are being optimized
+        optimizer_ft = optim.SGD(model_ft.parameters(), lr=lr, momentum=0.9)
+
+        # Decay LR by a factor of 0.1 every 7 epochs
+        exp_lr_scheduler = lr_scheduler.StepLR(optimizer_ft, step_size=7, gamma=0.1)
+    
+# -----------------------------------------------------------------------------------------------
+# TRAINING FINE-TUNING NETWORK
+# -----------------------------------------------------------------------------------------------
+        
+        model_ft = train_model(model_ft, criterion, optimizer_ft, exp_lr_scheduler, num_epochs=num_epochs)
+        #visualize_model(model_ft)
+        
+# -----------------------------------------------------------------------------------------------
+# ADJUSTING FIXED EXTRACTION PARAMETERS
+# -----------------------------------------------------------------------------------------------
+
+    if model_type == 'conv':    
+        
+        if model_name == 'resnet':
+    
+            model_conv = torchvision.models.resnet18(pretrained=True)
+            for param in model_conv.parameters():
+                param.requires_grad = False
+            
+            # Parameters of newly constructed modules have requires_grad=True by default
+            num_ftrs = model_conv.fc.in_features
+            model_conv.fc = nn.Linear(num_ftrs, num_classes)
+            
+            model_conv = model_conv.to(device)
+
+            criterion = nn.CrossEntropyLoss()
+
+            # Observe that only parameters of final layer are being optimized as
+            # opposed to before.
+            optimizer_conv = optim.SGD(model_conv.fc.parameters(), lr=lr, momentum=0.9)
+        
+        if model_name == 'alexnet':
+        
+            model_conv = models.alexnet(pretrained=True)
+            for param in model_conv.parameters():
+                param.requires_grad = False
+            
+            num_ftrs = model_conv.classifier[6].in_features
+            model_conv.classifier[6] = nn.Linear(num_ftrs,num_classes)
+
+            model_conv = model_conv.to(device)
+
+            criterion = nn.CrossEntropyLoss()
+
+            # Observe that only parameters of final layer are being optimized as
+            # opposed to before.
+            optimizer_conv = optim.SGD(model_conv.classifier[6].parameters(), lr=lr, momentum=0.9)
+
+        # Decay LR by a factor of 0.1 every 7 epochs
+        exp_lr_scheduler = lr_scheduler.StepLR(optimizer_conv, step_size=7, gamma=0.1)
+
+# -----------------------------------------------------------------------------------------------
+# TRAINING FIXED EXTRACTION NETWORK
+# -----------------------------------------------------------------------------------------------
+    
+        model_conv = train_model(model_conv, criterion, optimizer_conv, exp_lr_scheduler, num_epochs=num_epochs)
+        #visualize_model(model_conv)
+    
+# -----------------------------------------------------------------------------------------------
+# CONFUSION MATRIX
+# -----------------------------------------------------------------------------------------------
+
+    def conf_matrix(model_type):
+        
+        if model_type == 'conv':
+            model = model_conv
+        if model_type == 'ft':
+            model = model_ft
+        was_training = model.training
+        model.eval()
+
+        lbls = []
+        prds = []
+
+        with torch.no_grad():
+            for inputs, labels in dataloaders['val']:
+                aux = labels.tolist()
+                lbls = lbls + aux
+            
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+
+                outputs = model(inputs)
+                _, preds = torch.max(outputs, 1)
+            
+                aux = preds.tolist()
+                prds = prds + aux
+
+                model.train(mode=was_training)
+            
+        return lbls, prds
+
+    lbls, prds = conf_matrix(model_type)
+
+    mat = confusion_matrix(lbls, prds)
+    avg_mat.append(mat)
+    
+# -----------------------------------------------------------------------------------------------
+# FUNCTION FOR EXTRACTING FEATURES VECTORS FROM IMAGES
+# -----------------------------------------------------------------------------------------------
+
+    class Img2Vec():
+
+        def __init__(self, model_name='resnet', model_type='ft', cuda=False):
+            self.device = torch.device("cuda" if cuda else "cpu")
+            if model_type == 'ft':
+                self.model = model_ft
+            if model_type == 'conv':
+                self.model = model_conv
+            self.extraction_layer = self.model._modules.get('avgpool')
+            self.model = self.model.to(self.device)
+
+            self.model.eval()
+
+        def get_vec(self, img):
+            if model_name == 'resnet':
+                my_embedding = torch.zeros(1, 512, 1, 1)
+            if model_name == 'alexnet':
+                my_embedding = torch.zeros(1, 256, 6, 6)
+        
+            def copy_data(m, i, o):
+                my_embedding.copy_(o.data)
+
+            h = self.extraction_layer.register_forward_hook(copy_data)
+            self.model(img)
+            h.remove()
+
+            return my_embedding
+        
+# -----------------------------------------------------------------------------------------------
+# EXTRACTING FEATURE MATRICES AND LABELS
+# -----------------------------------------------------------------------------------------------
+    
+    img2vec = Img2Vec(model_name, model_type)
+    
+    if model_name == 'resnet':
+        vec_length = 512
+    if model_name == 'alexnet':
+        vec_length = 256
+
+    samples = image_datasets['train'].__len__()  # Amount of samples to take from input path
+    samples2 = image_datasets['val'].__len__()
+
+    # Matrix to hold the image vectors
+    vec_mat = np.zeros((samples, vec_length))
+    labels = np.zeros(samples)
+    vec_mat2 = np.zeros((samples2, vec_length))
+    labels2 = np.zeros(samples2)
+
+    for i in range(samples):
+    
+        img, label = image_datasets['train'].__getitem__(i)
+        img = img.unsqueeze(0)
+        vec = img2vec.get_vec(img)
+        labels[i] = label
+        vec_mat[i, :] = vec[0,:,0,0]
+    
+    for i in range(samples2):
+    
+        img2, label2 = image_datasets['val'].__getitem__(i)
+        img2 = img2.unsqueeze(0)
+        vec2 = img2vec.get_vec(img2)
+        labels2[i] = label2
+        vec_mat2[i, :] = vec2[0,:,0,0]
+        
+# -----------------------------------------------------------------------------------------------
+# STORING CONVOLUTIONAL LAYERS
+# -----------------------------------------------------------------------------------------------
+    
+    if model_name == 'resnet':
+        
+        model_weights = []
+        conv_layers = []
+        model_children = list(model_conv.children())
+        counter = 0
+        for i in range(len(model_children)):
+            if type(model_children[i]) == nn.Conv2d:
+                counter+=1
+                model_weights.append(model_children[i].weight)
+                conv_layers.append(model_children[i])
+            else: 
+                if type(model_children[i]) == nn.Sequential:
+                    for j in range(len(model_children[i])):
+                        for child in model_children[i][j].children():
+                            if type(child) == nn.Conv2d:
+                                counter+=1
+                                model_weights.append(child.weight)
+                                conv_layers.append(child)
+        
+# -----------------------------------------------------------------------------------------------
+# DISPLAYING FEATURE MAPS
+# -----------------------------------------------------------------------------------------------
+ 
+    transform2 = transforms.Compose([transforms.ToTensor(),
+    ])
+    
+    model_conv = model_conv.to(device)
+    
+    #image = Image.open(r'D:\Datasets\Databases\Cysts4\Radiculares\r01_1_1.tif')
+    #image = Image.open(r'D:\Datasets\Databases\Cysts4\Esporadicos_Sindromicos\k02_2_1.tif')
+    image = Image.open(r'D:\Datasets\Databases\Cysts4\Esporadicos_Sindromicos\s01_4_1.tif')
+    
+    image = transform2(image)
+    image = image.unsqueeze(0)
+    image = image.to(device)
+    
+    outputs = []
+    names = []
+    for layer in conv_layers[0:]:
+        image = layer(image)
+        outputs.append(image)
+            
+    processed = []
+    for feature_map in outputs:
+        feature_map = feature_map.squeeze(0)
+        gray_scale = torch.sum(feature_map,0)
+        gray_scale = gray_scale / feature_map.shape[0]
+        processed.append(gray_scale.data.cpu().numpy())
+        
+    fig = plt.figure(figsize=(30, 50))
+    for i in range(len(processed)):
+        a = fig.add_subplot(5, 4, i+1)
+        imgplot = plt.imshow(processed[i])
+        a.axis("off")
+        a.set_title(r'{} Conv2d layer'.format(i+1), fontsize=30)
+    plt.show()
+        
+# -----------------------------------------------------------------------------------------------
+# APPLYING PCA
+# -----------------------------------------------------------------------------------------------
+        
+    pca = PCA(48)
+
+    vec_mat_ = vec_mat
+    vec_mat2_ = vec_mat2
+    
+    #vec_mat = pca.fit_transform(vec_mat)
+    #vec_mat2 = pca.fit_transform(vec_mat2)
+        
+# -----------------------------------------------------------------------------------------------
+# TRAINING SVM, KNN, LDA AND RF CLASSIFIERS
+# -----------------------------------------------------------------------------------------------
+
+    since2 = time.time()
+    clf = LinearDiscriminantAnalysis().fit(vec_mat, labels)
+    avg_clf1.append(clf.score(vec_mat2, labels2))
+    print('Best val Acc (LDA): {:4f}'.format(clf.score(vec_mat2, labels2)))
+    scores2 = clf.predict_proba(vec_mat2_)
+    scores_train2 = clf.predict_proba(vec_mat_)
+    clf1 = clf.predict(vec_mat2)
+    print('TIME LDA: {:4f}'.format(time.time() - since2))
+
+    since2 = time.time()
+    clf = svm.SVC(kernel='linear', C=1, probability=True).fit(vec_mat_, labels)
+    avg_clf2.append(clf.score(vec_mat2_, labels2))
+    print('Best val Acc (SVM): {:4f}'.format(clf.score(vec_mat2_, labels2)))
+    scores = clf.predict_proba(vec_mat2_)
+    scores_train = clf.predict_proba(vec_mat_)
+    clf2 = clf.predict(vec_mat2_)
+    print('TIME SVM: {:4f}'.format(time.time() - since2))
+
+    since2 = time.time()
+    clf = RandomForestClassifier(n_estimators=100, max_depth=2, random_state=0).fit(vec_mat_, labels)
+    avg_clf3.append(clf.score(vec_mat2_, labels2))
+    print('Best val Acc (RF): {:4f}'.format(clf.score(vec_mat2_, labels2)))
+    clf3 = clf.predict(vec_mat2_)
+    print('TIME RF: {:4f}'.format(time.time() - since2))
+    
+    since2 = time.time()
+    clf = NearestCentroid().fit(vec_mat_, labels)
+    avg_clf4.append(clf.score(vec_mat2_, labels2))
+    print('Best val Acc (KNN): {:4f}'.format(clf.score(vec_mat2_, labels2)))
+    clf4 = clf.predict(vec_mat2_)
+    print('TIME KNN: {:4f}'.format(time.time() - since2))
+
+# -----------------------------------------------------------------------------------------------
+# LBP METHOD
+# -----------------------------------------------------------------------------------------------   
+    
+    since2 = time.time()
+    
+    class LocalBinaryPatterns:
+        def __init__(self, numPoints, radius):
+		# store the number of points and radius
+            self.numPoints = numPoints
+            self.radius = radius
+ 
+        def describe(self, image, eps=1e-7):
+		# compute the Local Binary Pattern representation
+		# of the image, and then use the LBP representation
+		# to build the histogram of patterns
+            lbp = feature.local_binary_pattern(image, self.numPoints,
+			    self.radius, method="uniform")
+            (hist, _) = np.histogram(lbp.ravel(),
+    			bins=np.arange(0, self.numPoints + 3),
+			    range=(0, self.numPoints + 2))
+ 
+		# normalize the histogram
+            hist = hist.astype("float")
+            hist /= (hist.sum() + eps)
+ 
+		# return the histogram of Local Binary Patterns
+            return hist 
+    
+# -----------------------------------------------------------------------------------------------
+# COMPUTING DISTANCES BETWEEN IMAGES AND CLASSES
+# -----------------------------------------------------------------------------------------------  
+    
+    def Nmaxelements(list1, N=5): 
+        final_list = [] 
+  
+        for i in range(0, N):  
+            max1 = 0
+          
+            for j in range(len(list1)):      
+                if list1[j] > max1: 
+                    max1 = list1[j]; 
+                  
+            list1.remove(max1); 
+            final_list.append(max1) 
+          
+        return final_list 
+
+    pesos = []
+    imagePaths = []
+    roots = []
+    roots1 = os.listdir(root)
+    for k in range(len(roots1)):
+        roots.append(os.path.join(root, roots1[k]))
+
+    desc = LocalBinaryPatterns(24, 8)
+    dists = []
+    tamanhos = []
+    
+    for root_dir in roots:
+        lista = os.listdir(root_dir)
+        root_list = [root_dir]*(len(lista))
+        tamanhos.append(len(lista)//2)
+        img_name = []
+        for k in range(len(lista)):
+            if lista[k] != 'Thumbs.db':
+                img_name.append(os.path.join(root_list[k], lista[k]))
+        
+        random.seed(seed1)
+        random.shuffle(img_name)    
+        img_name.reverse()
+        imagePaths = imagePaths + img_name[:len(img_name)//2]
+        
+    tam_totais = np.cumsum(tamanhos)
+    tam_totais = np.insert(tam_totais, 0, 0)
+    
+    histogramas = []
+
+    for imagePath in imagePaths:
+
+    # load the image, convert it to grayscale, and describe it
+        image = cv2.imread(imagePath)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        hist = desc.describe(gray)
+        histogramas.append(hist)
+        
+    dists = []
+
+    for histograma in histogramas: #fixes one image as reference
+        distances = []
+        
+        for i in range(len(tamanhos)):
+            dist = []
+            
+            for j in range(tamanhos[i]):
+                dist.append(np.linalg.norm(histogramas[j + tam_totais[i]] - histograma))
+
+            dista = Nmaxelements(dist, 5)
+            dist = np.average(dista,axis=0)
+            distances.append(dist)
+            
+        dists.append(distances)
+    
+# -----------------------------------------------------------------------------------------------
+# COMPUTING WEIGHTS AND ACCURACY (FC1)
+# -----------------------------------------------------------------------------------------------  
+        
+        peso = np.zeros(len(distances))
+        for k in range(len(distances)):
+            aux = distances.copy()
+            del aux[k]
+            for j in range(len(aux)):
+                peso[k] = peso[k] + aux[j]
+            peso[k] = peso[k]/distances[k]
+    
+        pesos.append(peso)
+    
+    result = []
+    for i in range(len(pesos)):
+        result.append(pesos[i] * scores[i])
+    
+    predict = []
+    for k in range(len(result)):
+        result[k] = result[k].tolist()
+        predict.append(result[k].index(max(result[k])))
+
+    match = 0
+    for j in range(len(predict)):
+        if predict[j] == labels[j]:
+            match = match + 1
+    match = match/len(predict)
+
+    avg_lbp.append(match)
+    print('Best val Acc (LBP): {:4f}'.format(match))
+    
+# -----------------------------------------------------------------------------------------------
+# SVM + LBP + NN (FC2)
+# -----------------------------------------------------------------------------------------------
+    
+    N, D_in, H, D_out = len(lbls), len(roots)*2, len(roots)*3*2, len(roots)
+
+    in_feature = []
+    scores_train = np.asarray(scores_train, dtype=np.float32)
+    dists = np.asarray(dists, dtype=np.float32)
+    in_feature = np.hstack((scores_train, dists))
+    x = torch.FloatTensor(in_feature) 
+    
+    test_feature = []
+    scores = np.asarray(scores, dtype=np.float32)
+    test_feature = np.hstack((scores, dists))
+    x_test = torch.FloatTensor(test_feature) 
+
+    y = []
+    for i in range(len(labels)):
+        aux = [0]*len(roots)
+        aux[int(labels[i])] = 1
+        y.append(aux)
+            
+    y = torch.FloatTensor(y)
+
+    model = torch.nn.Sequential(torch.nn.Linear(D_in, H),torch.nn.ReLU(),torch.nn.Linear(H, D_out), nn.Softmax(dim=1))
+
+    loss_fn = torch.nn.MSELoss()
+    #loss_fn = torch.nn.CrossEntropyLoss()
+
+    learning_rate = 0.1 #cysts
+    #learning_rate = 1.1 #plants
+    #learning_rate = 1.6 #UIUC and UMD
+    
+    num_epochs2 = num_epochs*20 #cysts
+    #num_epochs2 = num_epochs*150 #plants
+    #num_epochs2 = num_epochs*800 #UIUC and UMD
+    
+    matches = []
+    predicts = []
+    for t in range(num_epochs2):
+
+        y_pred = model(x)
+        loss = loss_fn(y_pred, y)
+#        if t % 10 == 9:
+        prdct=[]
+        y_pred = y_pred.tolist()
+        for k in range(len(y_pred)):
+            prdct.append(y_pred[k].index(max(y_pred[k])))
+            
+        match = 0
+        for j in range(len(prdct)):
+            if prdct[j] == labels[j]:
+                match = match + 1
+        match = match/len(prdct)
+                    
+        #print('Epoch {}/{}'.format(t,num_epochs2))
+        #print('------------')
+        #print('train Loss: {:.4f} Acc: {:.4f}'.format(loss.item(), match))
+            
+        y_test = model(x_test)
+        loss_test = loss_fn(y_test, y)
+            
+        prdct_test=[]
+        y_test = y_test.tolist()
+        for k in range(len(y_test)):
+            prdct_test.append(y_test[k].index(max(y_test[k])))
+        predicts.append(prdct_test)
+            
+        match = 0
+        for j in range(len(prdct_test)):
+            if prdct_test[j] == labels[j]:
+                match = match + 1
+        match = match/len(prdct_test)
+        matches.append(match)
+        #print('val Loss: {:.4f} Acc: {:.4f}'.format(loss_test.item(), match))
+        #print(' ')
+
+        model.zero_grad()
+
+        loss.backward()
+
+        with torch.no_grad():
+            for param in model.parameters():
+                param -= learning_rate * param.grad
+    
+    best_acc = max(matches)
+    best_predict = predicts[matches.index(max(matches))]
+    avg_lbpnn.append(best_acc)
+    print('Best val Acc (LBPNN): {:4f}'.format(best_acc))
+    
+    
+# -----------------------------------------------------------------------------------------------
+# SVM + LDA + LBP + NN (FC3)
+# -----------------------------------------------------------------------------------------------
+  
+    N, D_in, H, D_out = len(lbls), len(roots)*3, len(roots)*3*2, len(roots)
+
+    in_feature = []
+    scores_train2 = np.asarray(scores_train2, dtype=np.float32)
+    dists = np.asarray(dists, dtype=np.float32)
+    in_feature = np.hstack((scores_train, scores_train2, dists))
+    x = torch.FloatTensor(in_feature) 
+    
+    test_feature = []
+    scores2 = np.asarray(scores2, dtype=np.float32)
+    test_feature = np.hstack((scores, scores2, dists))
+    x_test = torch.FloatTensor(test_feature) 
+
+    y = []
+    for i in range(len(labels)):
+        aux = [0]*len(roots)
+        aux[int(labels[i])] = 1
+        y.append(aux)
+            
+    y = torch.FloatTensor(y)
+
+    model = torch.nn.Sequential(torch.nn.Linear(D_in, H),torch.nn.ReLU(),torch.nn.Linear(H, D_out), nn.Softmax(dim=1))
+
+    loss_fn = torch.nn.MSELoss()
+
+    matches = []
+    predicts = []
+    for t in range(num_epochs2):
+
+        y_pred = model(x)
+        loss = loss_fn(y_pred, y)
+#        if t % 10 == 9:
+        prdct=[]
+        y_pred = y_pred.tolist()
+        for k in range(len(y_pred)):
+            prdct.append(y_pred[k].index(max(y_pred[k])))
+        match = 0
+        for j in range(len(prdct)):
+            if prdct[j] == labels[j]:
+                match = match + 1
+        match = match/len(prdct)
+                    
+        #print('Epoch {}/{}'.format(t,num_epochs2))
+        #print('------------')
+        #print('train Loss: {:.4f} Acc: {:.4f}'.format(loss.item(), match))
+            
+        y_test = model(x_test)
+        loss_test = loss_fn(y_test, y)
+            
+        prdct_test=[]
+        y_test = y_test.tolist()
+        for k in range(len(y_test)):
+            prdct_test.append(y_test[k].index(max(y_test[k])))
+        predicts.append(prdct_test)
+            
+        match = 0
+        for j in range(len(prdct_test)):
+            if prdct_test[j] == labels[j]:
+                match = match + 1
+        match = match/len(prdct_test)
+        matches.append(match)
+        #print('val Loss: {:.4f} Acc: {:.4f}'.format(loss_test.item(), match))
+        #print(' ')
+
+        model.zero_grad()
+
+        loss.backward()
+
+        with torch.no_grad():
+            for param in model.parameters():
+                param -= learning_rate * param.grad
+    
+    best_acc2 = max(matches)
+    best_predict2 = predicts[matches.index(max(matches))]
+    avg_lbpnn2.append(best_acc2)
+    print('Best val Acc (LBPNN2): {:4f}'.format(best_acc2))
+    print('TIME: {:4f}'.format(time.time() - since2))
+
+# -----------------------------------------------------------------------------------------------
+# ENSEMBLE
+# -----------------------------------------------------------------------------------------------
+    
+    ens_list2 = []
+    ens_list3 = []
+    result = []
+    ensemble = []
+    ensemb = []
+    
+    ens_list = [prds, clf1, clf2, clf3, clf4, predict, best_predict]
+    
+    for i in range(len(ens_list)):    
+        ensemb.append(np.mean(np.array(ens_list[i]) == np.array(labels2)))
+    minIndex = ensemb.index(min(ensemb))
+    del ens_list[minIndex] #removing worst classifier
+    del ensemb[minIndex]
+    minIndex = ensemb.index(min(ensemb))
+    del ens_list[minIndex] #removing second worst classifier
+    
+    def most_frequent(List): 
+        return max(set(List), key = List.count) 
+    
+    for i in range(2,len(ens_list)+1):
+        ens_list2.append(list(itertools.combinations(ens_list, i))) #ensemble combinations
+   
+    for i in range(len(ens_list2)):
+        ens_list3 = ens_list3 + ens_list2[i] 
+        
+    for i in range(len(ens_list3)):    
+        for a in range(len(prds)):
+            ens_list4 = [item[a] for item in ens_list3[i]]
+            result.append(most_frequent(ens_list4))
+        ensemble.append(np.mean(np.array(result) == np.array(labels2)))
+        result = []
+        
+
+    print('Best val Acc (ENSEMBLE): {:4f}'.format(max(ensemble)))
+    avg_ens.append(max(ensemble))
+    
+    time_elapsed = time.time() - since0
+    print('Training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
+    avg_time.append(time_elapsed)
+
+    
+# -----------------------------------------------------------------------------------------------
+# PRECISION RECALL CURVE
+# -----------------------------------------------------------------------------------------------   
+    
+    if num_classes == 2:
+    
+        clf = svm.SVC(kernel='linear', C=1).fit(vec_mat_, labels)
+        y_score = clf.decision_function(vec_mat2_)
+    
+        average_precision = average_precision_score(labels2, y_score)
+    
+        print('Average precision-recall score: {0:0.2f}'.format(average_precision))
+        avg_prec_rec.append(average_precision)
+    
+        precision, recall, _ = precision_recall_curve(labels2, y_score)
+
+        # In matplotlib < 1.5, plt.fill_between does not have a 'step' argument
+        step_kwargs = ({'step': 'post'}
+                       if 'step' in signature(plt.fill_between).parameters
+                       else {})
+        plt.step(recall, precision, color='b', alpha=0.2,where='post')
+        plt.fill_between(recall, precision, alpha=0.2, color='b', **step_kwargs)
+
+        plt.xlabel('Recall')
+        plt.ylabel('Precision')
+        plt.ylim([0.0, 1.05])
+        plt.xlim([0.0, 1.0])
+        plt.title('2-class Precision-Recall curve: AP={0:0.2f}'.format(average_precision))
+        plt.show()
+        
+    else:
+    
+        # Run classifier
+        classifier = OneVsRestClassifier(svm.LinearSVC(max_iter=10000))
+        classifier.fit(vec_mat, labels)
+        y_score = classifier.decision_function(vec_mat2)
+
+        # Use label_binarize to be multi-label like settings
+        lbls2 = label_binarize(labels2, classes=range(num_classes))
+        n_classes = lbls2.shape[1]
+
+        # For each class
+        precision = dict()
+        recall = dict()
+        average_precision = dict()
+        for i in range(num_classes):
+            precision[i], recall[i], _ = precision_recall_curve(lbls2[:,i], y_score[:,i])
+            average_precision[i] = average_precision_score(lbls2[:,i], y_score[:,i])
+            #print(average_precision[i])
+
+        lbls2 = np.asarray(lbls2)
+        prds = np.asarray(prds)
+
+        # A "micro-average": quantifying score on all classes jointly
+        precision["micro"], recall["micro"], _ = precision_recall_curve(lbls2.ravel(), y_score.ravel())
+        average_precision["micro"] = average_precision_score(lbls2, y_score, average="micro")
+        avg_recall.append(average_precision["micro"]) 
+        print('Average precision score, micro-averaged over all classes: {0:0.2f}'.format(average_precision["micro"]))
+        avg_prec_rec.append(average_precision["micro"])
+    
+        step_kwargs = ({'step': 'post'}
+                   if 'step' in signature(plt.fill_between).parameters
+                   else {})
+
+        f = plt.figure()    
+        plt.step(recall['micro'], precision['micro'], color='b', alpha=0.2, where='post')
+        plt.fill_between(recall["micro"], precision["micro"], alpha=0.2, color='b', **step_kwargs)
+        plt.xlabel('Recall')
+        plt.ylabel('Precision')
+        plt.ylim([0.0, 1.0])
+        plt.xlim([0.0, 1.0])
+        plt.show()
+
+# -----------------------------------------------------------------------------------------------
+# AVERAGING AND DISPLAYING RESULTS
+# -----------------------------------------------------------------------------------------------     
+
+    d = d + 1
+
+x = range(0,15)
+avg_epoch_loss = np.average(avg_epoch_loss,axis=0)
+avg_train_loss = np.average(avg_train_loss,axis=0)
+plt.plot(x, avg_epoch_loss, marker='o', color='black')
+plt.plot(x, avg_train_loss, marker='o', color='red')
+plt.xlabel('epochs')
+plt.ylabel('loss')
+plt.legend(('Test', 'Train'),
+           loc='upper right')
+plt.show()
+
+avg_mat = np.average(avg_mat, axis=0)
+print(avg_mat)
+fig, ax = plt.subplots()     
+greys = cm.get_cmap('Greys', 256) 
+psm = ax.pcolormesh(avg_mat, cmap=greys, rasterized=True)
+fig.colorbar(psm, ax=ax)
+plt.show()
+
+avg_best_acc1 = []
+for i in range(len(avg_best_acc)):
+    avg_best_acc1.append(avg_best_acc[i].cpu().numpy())
+
+print('Best val Acc: {:4f}'.format(np.average(avg_best_acc1)))
+print('Standard deviation: {:4f}'.format(np.std(avg_best_acc1)))
+print('Best val Acc (LDA): {:4f}'.format(np.average(avg_clf1,axis=0)))
+print('Standard deviation: {:4f}'.format(np.std(avg_clf1,axis=0)))
+print('Best val Acc (SVM): {:4f}'.format(np.average(avg_clf2,axis=0)))
+print('Standard deviation: {:4f}'.format(np.std(avg_clf2,axis=0)))
+print('Best val Acc (RF): {:4f}'.format(np.average(avg_clf3,axis=0)))
+print('Standard deviation: {:4f}'.format(np.std(avg_clf3,axis=0)))
+print('Best val Acc (KNN): {:4f}'.format(np.average(avg_clf4,axis=0)))
+print('Standard deviation: {:4f}'.format(np.std(avg_clf4,axis=0)))
+print('Best val Acc (LBP): {:4f}'.format(np.average(avg_lbp,axis=0)))
+print('Standard deviation: {:4f}'.format(np.std(avg_lbp,axis=0)))
+print('Best val Acc (LBPNN): {:4f}'.format(np.average(avg_lbpnn,axis=0)))
+print('Standard deviation: {:4f}'.format(np.std(avg_lbpnn,axis=0)))
+print('Best val Acc (LBPNN2): {:4f}'.format(np.average(avg_lbpnn2,axis=0)))
+print('Standard deviation: {:4f}'.format(np.std(avg_lbpnn2,axis=0)))
+print('Best val Acc (ENSEMBLE): {:4f}'.format(np.average(avg_ens,axis=0)))
+print('Standard deviation: {:4f}'.format(np.std(avg_ens,axis=0)))
+print('Time elapsed: {:.0f}m {:.0f}s'.format(np.average(avg_time,axis=0) // 60, np.average(avg_time,axis=0) % 60))
+print('Standard deviation: {:4f}'.format(np.std(avg_time,axis=0)))
+print('Average precision-recall score: {:4f}'.format(np.average(avg_ens,axis=0)))
+print('Standard deviation: {:4f}'.format(np.std(avg_ens,axis=0)))
