@@ -87,14 +87,9 @@ for seed1 in seeds:
             for k in range(len(lista)):
                 if lista[k] != 'Thumbs.db':
                     img_name.append(os.path.join(root_list[k], lista[k]))
-                    
-            casewise = [img_name[i:i+5] for i in range(0,len(img_name), 5)]  #CASE-WISE grouping patients
         
             random.seed(seed1) # seed
             random.shuffle(img_name) 
-            
-            img_name = [item for sublist in casewise for item in sublist]  #CASE-WISE flattening
-            
             if self.sample == 'train':   
                 img_name.reverse()
             image = io.imread(img_name[idx])
@@ -158,8 +153,8 @@ for seed1 in seeds:
     #root = r'D:\Datasets\Databases\uiuc' #texture dataset (UIUC)
     #root = r'D:\Datasets\Databases\umd' #texture dataset (UMD)
     
-    model_name = 'resnet'
-    #model_name = 'alexnet'
+    #model_name = 'resnet'
+    model_name = 'alexnet'
     #model_type = 'ft'
     model_type = 'conv'
     num_epochs = 15
@@ -564,24 +559,6 @@ for seed1 in seeds:
     
     #vec_mat = pca.fit_transform(vec_mat)
     #vec_mat2 = pca.fit_transform(vec_mat2)
-    
-# -----------------------------------------------------------------------------------------------
-# FUNCTION TO COMUTE ACCURACY PER PATIENT (CASE-WISE)
-# -----------------------------------------------------------------------------------------------
-        
-    def most_frequent(List): 
-        return max(set(List), key = List.count) 
-    
-    def case_wise(predictions, labels):
-        
-        casewise = [predictions[i:i+5] for i in range(0,len(predictions), 5)]  #CASE-WISE grouping patients
-        labels = [labels[i] for i in range(0,len(labels), 5)]
-        
-        preds = []
-        for person in casewise:
-            preds.append(most_frequent(person.tolist()))
-            
-        return np.mean(np.array(preds) == np.array(labels))
         
 # -----------------------------------------------------------------------------------------------
 # TRAINING SVM, KNN, LDA AND RF CLASSIFIERS
@@ -687,13 +664,8 @@ for seed1 in seeds:
             if lista[k] != 'Thumbs.db':
                 img_name.append(os.path.join(root_list[k], lista[k]))
         
-        casewise = [img_name[i:i+5] for i in range(0,len(img_name), 5)]  #CASE-WISE grouping patients
-        
         random.seed(seed1)
         random.shuffle(img_name)    
-        
-        img_name = [item for sublist in casewise for item in sublist]  #CASE-WISE flattening
-        
         img_name.reverse()
         imagePaths = imagePaths + img_name[:len(img_name)//2]
         
@@ -755,8 +727,6 @@ for seed1 in seeds:
         if predict[j] == labels[j]:
             match = match + 1
     match = match/len(predict)
-    
-    match = case_wise(np.array(predict), labels) #CASE-WISE
 
     avg_lbp.append(match)
     print('Best val Acc (LBP): {:4f}'.format(match))
@@ -835,9 +805,6 @@ for seed1 in seeds:
             if prdct_test[j] == labels[j]:
                 match = match + 1
         match = match/len(prdct_test)
-        
-        match = case_wise(np.array(prdct_test), labels) #CASE-WISE
-        
         matches.append(match)
         #print('val Loss: {:.4f} Acc: {:.4f}'.format(loss_test.item(), match))
         #print(' ')
@@ -920,9 +887,6 @@ for seed1 in seeds:
             if prdct_test[j] == labels[j]:
                 match = match + 1
         match = match/len(prdct_test)
-        
-        match = case_wise(np.array(prdct_test), labels) #CASE-WISE
-        
         matches.append(match)
         #print('val Loss: {:.4f} Acc: {:.4f}'.format(loss_test.item(), match))
         #print(' ')
@@ -955,14 +919,14 @@ for seed1 in seeds:
     ens_list = [prds, clf1, clf2, clf3, clf4, predict, best_predict]
     
     for i in range(len(ens_list)):    
-        ensemb.append(case_wise(np.array(ens_list[i]), labels2)) #CASE-WISE
+        ensemb.append(np.mean(np.array(ens_list[i]) == np.array(labels2)))
     minIndex = ensemb.index(min(ensemb))
     del ens_list[minIndex] #removing worst classifier
     del ensemb[minIndex]
     minIndex = ensemb.index(min(ensemb))
     del ens_list[minIndex] #removing second worst classifier
     
-    def most_frequent2(List): 
+    def most_frequent(List): 
         return max(set(List), key = List.count) 
     
     for i in range(2,len(ens_list)+1):
@@ -974,8 +938,8 @@ for seed1 in seeds:
     for i in range(len(ens_list3)):    
         for a in range(len(prds)):
             ens_list4 = [item[a] for item in ens_list3[i]]
-            result.append(most_frequent2(ens_list4))
-        ensemble.append(case_wise(np.array(result), labels2)) #CASE-WISE
+            result.append(most_frequent(ens_list4))
+        ensemble.append(np.mean(np.array(result) == np.array(labels2)))
         predictions.append(result)
         result = []
         
