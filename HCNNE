@@ -1,37 +1,34 @@
 from __future__ import print_function, division
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.optim import lr_scheduler
-import numpy as np
-import torchvision
-from torchvision import datasets, models, transforms
-from torch.utils.data import Dataset, DataLoader
-import matplotlib.pyplot as plt
 import time
 import os
 import copy
 import random
-from os.path import normpath, basename
-from skimage import io
-from PIL import Image
-from sklearn.metrics import confusion_matrix
+import itertools
+import cv2
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import torchvision
+from torch.optim import lr_scheduler
+from torchvision import datasets, models, transforms
+from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
 from matplotlib import cm
+from os.path import normpath, basename
+from PIL import Image
+from inspect import signature
+from sklearn.metrics import confusion_matrix, roc_curve, auc, classification_report, precision_recall_curve, average_precision_score
 from sklearn import svm
 from sklearn.neighbors.nearest_centroid import NearestCentroid
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.decomposition import PCA
-import itertools
-from sklearn.metrics import precision_recall_curve
-from sklearn.metrics import average_precision_score
-from inspect import signature
-from sklearn.metrics import roc_curve, auc
 from sklearn.preprocessing import label_binarize
 from sklearn.multiclass import OneVsRestClassifier
-from skimage import feature
 from sklearn.svm import LinearSVC
-import cv2
+from skimage import feature
+from skimage import io
 
 plt.ion()
 
@@ -90,9 +87,14 @@ for seed1 in seeds:
             for k in range(len(lista)):
                 if lista[k] != 'Thumbs.db':
                     img_name.append(os.path.join(root_list[k], lista[k]))
+                    
+            casewise = [img_name[i:i+5] for i in range(0,len(img_name), 5)]  #CASE-WISE grouping patients
         
             random.seed(seed1) # seed
             random.shuffle(img_name) 
+            
+            img_name = [item for sublist in casewise for item in sublist]  #CASE-WISE flattening
+            
             if self.sample == 'train':   
                 img_name.reverse()
             image = io.imread(img_name[idx])
@@ -147,7 +149,7 @@ for seed1 in seeds:
     }
     
 # -----------------------------------------------------------------------------------------------
-# SETTING DATABASE ROOTS
+# SETTING DATABASE ROOTS AND PARAMETERS
 # -----------------------------------------------------------------------------------------------
   
     root = r'D:\Datasets\Databases\Cysts4' #two classes cysts dataset (ks x r)
@@ -155,6 +157,13 @@ for seed1 in seeds:
     #root = r'D:\Datasets\Databases\Cysts2' #three classes cysts dataset (k x s x r)
     #root = r'D:\Datasets\Databases\uiuc' #texture dataset (UIUC)
     #root = r'D:\Datasets\Databases\umd' #texture dataset (UMD)
+    
+    model_name = 'resnet'
+    #model_name = 'alexnet'
+    #model_type = 'ft'
+    model_type = 'conv'
+    num_epochs = 15
+    lr = 0.0001
 
 # -----------------------------------------------------------------------------------------------
 # LOADING AND ADJUSTING DATASETS
@@ -293,13 +302,7 @@ for seed1 in seeds:
 # -----------------------------------------------------------------------------------------------
     
     num_classes = len(class_names)
-    model_name = 'resnet'
-    #model_name = 'alexnet'
-    #model_type = 'ft'
-    model_type = 'conv'
-    num_epochs = 15
-    lr = 0.0001
-    
+
     if model_type == 'ft':
         if model_name == 'resnet':
     
@@ -519,36 +522,36 @@ for seed1 in seeds:
     transform2 = transforms.Compose([transforms.ToTensor(),
     ])
     
-    model_conv = model_conv.to(device)
+    #model_conv = model_conv.to(device)
     
     #image = Image.open(r'D:\Datasets\Databases\Cysts4\Radiculares\r01_1_1.tif')
     #image = Image.open(r'D:\Datasets\Databases\Cysts4\Esporadicos_Sindromicos\k02_2_1.tif')
-    image = Image.open(r'D:\Datasets\Databases\Cysts4\Esporadicos_Sindromicos\s01_4_1.tif')
+    #image = Image.open(r'D:\Datasets\Databases\Cysts4\Esporadicos_Sindromicos\s01_4_1.tif')
     
-    image = transform2(image)
-    image = image.unsqueeze(0)
-    image = image.to(device)
+    #image = transform2(image)
+    #image = image.unsqueeze(0)
+    #image = image.to(device)
     
     outputs = []
     names = []
-    for layer in conv_layers[0:]:
-        image = layer(image)
-        outputs.append(image)
+    #for layer in conv_layers[0:]:
+        #image = layer(image)
+        #outputs.append(image)
             
     processed = []
-    for feature_map in outputs:
-        feature_map = feature_map.squeeze(0)
-        gray_scale = torch.sum(feature_map,0)
-        gray_scale = gray_scale / feature_map.shape[0]
-        processed.append(gray_scale.data.cpu().numpy())
+    #for feature_map in outputs:
+        #feature_map = feature_map.squeeze(0)
+        #gray_scale = torch.sum(feature_map,0)
+        #gray_scale = gray_scale / feature_map.shape[0]
+        #processed.append(gray_scale.data.cpu().numpy())
         
-    fig = plt.figure(figsize=(30, 50))
-    for i in range(len(processed)):
-        a = fig.add_subplot(5, 4, i+1)
-        imgplot = plt.imshow(processed[i])
-        a.axis("off")
-        a.set_title(r'{} Conv2d layer'.format(i+1), fontsize=30)
-    plt.show()
+    #fig = plt.figure(figsize=(30, 50))
+    #for i in range(len(processed)):
+        #a = fig.add_subplot(5, 4, i+1)
+        #imgplot = plt.imshow(processed[i])
+        #a.axis("off")
+        #a.set_title(r'{} Conv2d layer'.format(i+1), fontsize=30)
+    #plt.show()
         
 # -----------------------------------------------------------------------------------------------
 # APPLYING PCA
@@ -561,6 +564,24 @@ for seed1 in seeds:
     
     #vec_mat = pca.fit_transform(vec_mat)
     #vec_mat2 = pca.fit_transform(vec_mat2)
+    
+# -----------------------------------------------------------------------------------------------
+# FUNCTION TO COMUTE ACCURACY PER PATIENT (CASE-WISE)
+# -----------------------------------------------------------------------------------------------
+        
+    def most_frequent(List): 
+        return max(set(List), key = List.count) 
+    
+    def case_wise(predictions, labels):
+        
+        casewise = [predictions[i:i+5] for i in range(0,len(predictions), 5)]  #CASE-WISE grouping patients
+        labels = [labels[i] for i in range(0,len(labels), 5)]
+        
+        preds = []
+        for person in casewise:
+            preds.append(most_frequent(person.tolist()))
+            
+        return np.mean(np.array(preds) == np.array(labels))
         
 # -----------------------------------------------------------------------------------------------
 # TRAINING SVM, KNN, LDA AND RF CLASSIFIERS
@@ -666,8 +687,13 @@ for seed1 in seeds:
             if lista[k] != 'Thumbs.db':
                 img_name.append(os.path.join(root_list[k], lista[k]))
         
+        casewise = [img_name[i:i+5] for i in range(0,len(img_name), 5)]  #CASE-WISE grouping patients
+        
         random.seed(seed1)
         random.shuffle(img_name)    
+        
+        img_name = [item for sublist in casewise for item in sublist]  #CASE-WISE flattening
+        
         img_name.reverse()
         imagePaths = imagePaths + img_name[:len(img_name)//2]
         
@@ -729,6 +755,8 @@ for seed1 in seeds:
         if predict[j] == labels[j]:
             match = match + 1
     match = match/len(predict)
+    
+    match = case_wise(np.array(predict), labels) #CASE-WISE
 
     avg_lbp.append(match)
     print('Best val Acc (LBP): {:4f}'.format(match))
@@ -807,6 +835,9 @@ for seed1 in seeds:
             if prdct_test[j] == labels[j]:
                 match = match + 1
         match = match/len(prdct_test)
+        
+        match = case_wise(np.array(prdct_test), labels) #CASE-WISE
+        
         matches.append(match)
         #print('val Loss: {:.4f} Acc: {:.4f}'.format(loss_test.item(), match))
         #print(' ')
@@ -889,6 +920,9 @@ for seed1 in seeds:
             if prdct_test[j] == labels[j]:
                 match = match + 1
         match = match/len(prdct_test)
+        
+        match = case_wise(np.array(prdct_test), labels) #CASE-WISE
+        
         matches.append(match)
         #print('val Loss: {:.4f} Acc: {:.4f}'.format(loss_test.item(), match))
         #print(' ')
@@ -916,18 +950,19 @@ for seed1 in seeds:
     result = []
     ensemble = []
     ensemb = []
+    predictions = []
     
     ens_list = [prds, clf1, clf2, clf3, clf4, predict, best_predict]
     
     for i in range(len(ens_list)):    
-        ensemb.append(np.mean(np.array(ens_list[i]) == np.array(labels2)))
+        ensemb.append(case_wise(np.array(ens_list[i]), labels2)) #CASE-WISE
     minIndex = ensemb.index(min(ensemb))
     del ens_list[minIndex] #removing worst classifier
     del ensemb[minIndex]
     minIndex = ensemb.index(min(ensemb))
     del ens_list[minIndex] #removing second worst classifier
     
-    def most_frequent(List): 
+    def most_frequent2(List): 
         return max(set(List), key = List.count) 
     
     for i in range(2,len(ens_list)+1):
@@ -939,8 +974,9 @@ for seed1 in seeds:
     for i in range(len(ens_list3)):    
         for a in range(len(prds)):
             ens_list4 = [item[a] for item in ens_list3[i]]
-            result.append(most_frequent(ens_list4))
-        ensemble.append(np.mean(np.array(result) == np.array(labels2)))
+            result.append(most_frequent2(ens_list4))
+        ensemble.append(case_wise(np.array(result), labels2)) #CASE-WISE
+        predictions.append(result)
         result = []
         
 
@@ -953,7 +989,7 @@ for seed1 in seeds:
 
     
 # -----------------------------------------------------------------------------------------------
-# PRECISION RECALL CURVE
+# PRECISION RECALL CURVE AND F1 SCORE
 # -----------------------------------------------------------------------------------------------   
     
     if num_classes == 2:
@@ -1024,6 +1060,8 @@ for seed1 in seeds:
         plt.ylim([0.0, 1.0])
         plt.xlim([0.0, 1.0])
         plt.show()
+        
+    print(classification_report(labels2, predictions[ensemble.index(max(ensemble))], target_names=class_names))
 
 # -----------------------------------------------------------------------------------------------
 # AVERAGING AND DISPLAYING RESULTS
